@@ -1,6 +1,10 @@
 # ============================================================
-# Libary
+# Adaptive MDA-Net 
 # ============================================================
+
+# =========================
+# Libraries
+# =========================
 import os, random, shutil
 import torch
 import torch.nn as nn
@@ -12,9 +16,10 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
-# ============================================================
+
+# =========================
 # Config
-# ============================================================
+# =========================
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 IMG_SIZE = 256
 BATCH_SIZE = 32
@@ -24,9 +29,11 @@ RAW_DATA = '/content/d1/d1'
 CSV_PATH = '/content/Label_EyeQ_train.csv'
 SPLIT_ROOT = '/content/split_data'
 SAVE_PATH = 'adaptive_mda_net.pth'
+FIQA_PATH = 'fiqa_trained.pth'
 SHOW_TRAIN_IMAGES = True
+
 # ============================================================
-# Dataset Splitting
+# Dataset Splitting (EyeQ protocol)
 # ============================================================
 quality_map = {0: 'Good', 1: 'Usable', 2: 'Reject'}
 for v in quality_map.values():
@@ -64,11 +71,10 @@ if os.path.exists(CSV_PATH):
 # 'level' can be 'low', 'mid', or 'high' to control severity of degradations
 
 def degrade_image_mdanet(img_pil, level='mid'):
-    # Resize to fixed size
+    """Simulate realistic retinal degradations (illumination, blur, noise)."""
     img_pil = img_pil.resize((IMG_SIZE, IMG_SIZE))
-    img = transforms.ToTensor()(img_pil)  # Convert to tensor in [0,1]
+    img = transforms.ToTensor()(img_pil)
 
-    # Define degradation levels
     levels = {
         'low':  {'gamma':0.8,'brightness':0.9,'blur':3,'noise':0.01},
         'mid':  {'gamma':1.2,'brightness':0.75,'blur':7,'noise':0.03},
@@ -76,27 +82,26 @@ def degrade_image_mdanet(img_pil, level='mid'):
     }
     p = levels[level]
 
-    # Apply vignette to simulate darker edges
+    # Vignette (uneven illumination)
     h, w = IMG_SIZE, IMG_SIZE
     y, x = torch.meshgrid(torch.linspace(-1,1,h), torch.linspace(-1,1,w), indexing='ij')
     vignette = 1 - 0.5 * (x**2 + y**2)
     vignette = vignette.clamp(0.4,1.0)
     img = img * vignette
 
-    # Apply gamma correction and brightness adjustment
-    img = img ** p['gamma']
-    img = img * p['brightness']
+    # Gamma + brightness
+    img = (img ** p['gamma']) * p['brightness']
     img = img.clamp(0,1)
 
-    # Create blurred version
+    # Blur
     blur_img = img_pil.filter(ImageFilter.GaussianBlur(radius=p['blur']))
     blur_img = transforms.ToTensor()(blur_img)
 
-    # Add random noise
+    # Noise
     noise = torch.randn_like(img) * p['noise']
     noisy = (img + noise).clamp(0,1)
 
-    # Random color shift per channel
+    # Color shift
     color_shift = torch.tensor([
         np.random.uniform(0.9,1.1),
         np.random.uniform(0.8,1.2),
@@ -104,11 +109,10 @@ def degrade_image_mdanet(img_pil, level='mid'):
     ]).view(3,1,1)
     noisy = (noisy * color_shift).clamp(0,1)
 
-    # Combine noisy and blurred images for realistic degradation
     degraded = 0.6 * noisy + 0.4 * blur_img
+    return degraded * 2 - 1   # [-1,1]
 
-    # Scale to [-1,1] for network input stability
-    return degraded * 2 - 1
+
 
 # ============================================================
 # Fundus Dataset with Integrated Degradation for MDA-Net
@@ -131,29 +135,20 @@ def degrade_image_mdanet(img_pil, level='mid'):
 
 class FundusDataset(Dataset):
     def __init__(self, root):
-        # Get all image paths from the specified root directory
-        self.paths = [os.path.join(root, x) for x in os.listdir(root)] if os.path.exists(root) else []
-
-        # Preprocessing transforms applied to the original image
+        self.paths = [os.path.join(root, x) for x in os.listdir(root)]
         self.tf = transforms.Compose([
-            transforms.Resize((IMG_SIZE, IMG_SIZE)),         
-            transforms.ToTensor(),                          
-            transforms.Normalize((0.5,)*3, (0.5,)*3)        
+            transforms.Resize((IMG_SIZE, IMG_SIZE)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,)*3, (0.5,)*3)
         ])
-    def __len__(self):
-        # Return total number of images in the dataset
-        return len(self.paths)
+
+    def __len__(self): return len(self.paths)
+
     def __getitem__(self, idx):
-        # Load image and convert to RGB
         img = Image.open(self.paths[idx]).convert('RGB')
-        # Select a random degradation level for augmentation
-        level = random.choice(['low', 'mid', 'high'])
-        # Apply domain-specific augmentation
-        # This produces the "degraded" input image Il
-        Il = degrade_image_mdanet(img, level)
-        # Preprocess the original image as the ground truth target
-        Ih = self.tf(img)
-        # Return degraded input, ground truth, and image path
+        level = random.choice(['low','mid','high'])
+        Il = degrade_image_mdanet(img, level)   # degraded input
+        Ih = self.tf(img)                       # clean target
         return Il, Ih, self.paths[idx]
 
 # ========================= ====================================================================================================================
@@ -166,38 +161,34 @@ class FundusDataset(Dataset):
 # ============================================================
 # Learns to emphasize important feature channels by generating a channel-wise attention map.
 # Uses global average pooling followed by a small MLP to produce channel weights.
+
 class ChannelAttention(nn.Module):
     def __init__(self, c, reduction=16):
         super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.avg = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Sequential(
-            nn.Linear(c, c // reduction, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(c // reduction, c, bias=False),
-            nn.Sigmoid()
+            nn.Linear(c, c//reduction), nn.ReLU(), nn.Linear(c//reduction, c), nn.Sigmoid()
         )
-    def forward(self, x):
+    def forward(self,x):
         b,c,_,_ = x.size()
-        y = self.avg_pool(x).view(b,c)
-        y = self.fc(y).view(b,c,1,1)
-        return x * y
+        y = self.fc(self.avg(x).view(b,c)).view(b,c,1,1)
+        return x*y
 
 # ============================================================
 # Spatial Attention 
 # ============================================================
 # Learns to emphasize important spatial locations by generating a spatial attention map.
 # Combines channel-wise max and average pooling, followed by a convolution and sigmoid activation.
+
 class SpatialAttention(nn.Module):
     def __init__(self):
         super().__init__()
         self.conv = nn.Conv2d(2,1,7,1,3)
-        self.sigmoid = nn.Sigmoid()
-    def forward(self, x):
-        avg = x.mean(1,keepdim=True)
-        max_ = x.max(1,keepdim=True)[0]
-        y = torch.cat([avg,max_],1)
-        y = self.sigmoid(self.conv(y))
-        return x * y
+    def forward(self,x):
+        avg = x.mean(1,True)
+        mx  = x.max(1,True)[0]
+        y = torch.cat([avg,mx],1)
+        return x * torch.sigmoid(self.conv(y))
 
 # ============================================================
 # Degradation Analyzer 
@@ -205,19 +196,13 @@ class SpatialAttention(nn.Module):
 # Computes a latent vector representing the type and level of image degradation.
 # Uses global average pooling and a small MLP to generate per-channel latent codes.
 class DegradationAnalyzer(nn.Module):
-    def __init__(self, input_channels=3, latent_dim=256):
+    def __init__(self):
         super().__init__()
         self.pool = nn.AdaptiveAvgPool2d(1)
-        self.analyze = nn.Sequential(
-            nn.Linear(input_channels,64),
-            nn.ReLU(inplace=True),
-            nn.Linear(64, latent_dim),
-            nn.Sigmoid()
-        )
-    def forward(self, x):
+        self.fc = nn.Sequential(nn.Linear(3,64), nn.ReLU(), nn.Linear(64,256), nn.Sigmoid())
+    def forward(self,x):
         b,c,_,_ = x.size()
-        y = self.pool(x).view(b,c)
-        return self.analyze(y).view(b,-1,1,1)
+        return self.fc(self.pool(x).view(b,c)).view(b,-1,1,1)
 
 # ============================================================
 # Dynamic Residual Block with Attention
@@ -228,23 +213,17 @@ class DynamicResBlock(nn.Module):
     def __init__(self,c):
         super().__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(c,c,3,1,1),
-            nn.InstanceNorm2d(c),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(c,c,3,1,1),
-            nn.InstanceNorm2d(c)
+            nn.Conv2d(c,c,3,1,1), nn.InstanceNorm2d(c), nn.ReLU(),
+            nn.Conv2d(c,c,3,1,1), nn.InstanceNorm2d(c)
         )
         self.ca = ChannelAttention(c)
         self.sa = SpatialAttention()
-        self.modulation = nn.Sequential(nn.Conv2d(256,c,1), nn.Sigmoid())
-    def forward(self,x,latent_vector):
-        out = self.conv(x)
-        mod = self.modulation(latent_vector)
-        out = out * mod
+        self.mod = nn.Sequential(nn.Conv2d(256,c,1), nn.Sigmoid())
+    def forward(self,x,lv):
+        out = self.conv(x) * self.mod(lv)
         out = self.ca(out)
         out = self.sa(out)
         return x + out
-
 # ============================================================
 # Adaptive Generator (MDA-Net Style, Improved)
 # ============================================================
@@ -260,38 +239,22 @@ class AdaptiveGenerator(nn.Module):
         self.enc1 = nn.Conv2d(3,64,4,2,1)
         self.enc2 = nn.Conv2d(64,128,4,2,1)
         self.enc3 = nn.Conv2d(128,256,4,2,1)
-        self.light_branch = nn.Sequential(
-            nn.Conv2d(3,16,3,1,1), nn.ReLU(),
-            nn.Conv2d(16,1,3,1,1), nn.Sigmoid()
-        )
-        self.res_blocks = nn.ModuleList([DynamicResBlock(256) for _ in range(4)])
+        self.blocks = nn.ModuleList([DynamicResBlock(256) for _ in range(4)])
         self.dec1 = nn.ConvTranspose2d(256,128,4,2,1)
         self.dec2 = nn.ConvTranspose2d(128,64,4,2,1)
         self.dec3 = nn.ConvTranspose2d(64,3,4,2,1)
-        self.refine_stage1 = nn.Sequential(
-            nn.Conv2d(3,64,3,1,1), nn.ReLU(),
-            nn.Conv2d(64,64,3,1,1), nn.ReLU(),
-            nn.Conv2d(64,3,3,1,1), nn.Tanh()
-        )
-        self.refine_stage2 = nn.Sequential(
-            nn.Conv2d(3,32,3,1,1), nn.ReLU(),
-            nn.Conv2d(32,3,3,1,1), nn.Tanh()
-        )
-
     def forward(self,x):
         lv = self.analyzer(x)
-        light = self.light_branch(x)
         e1 = F.relu(self.enc1(x))
         e2 = F.relu(self.enc2(e1))
         e3 = F.relu(self.enc3(e2))
         f = e3
-        for block in self.res_blocks: f = block(f,lv)
+        for b in self.blocks:
+            f = b(f,lv)
         d1 = F.relu(self.dec1(f)) + e2
         d2 = F.relu(self.dec2(d1)) + e1
-        coarse = torch.tanh(self.dec3(d2))
-        refined1 = self.refine_stage1(coarse*(light+1))
-        refined2 = self.refine_stage2(refined1)
-        return refined2
+        return torch.tanh(self.dec3(d2))
+
 
 # ============================================================
 # Losses (Added FFT Frequency Loss)
@@ -312,92 +275,72 @@ class VGGPerceptual(nn.Module):
         vgg = models.vgg16(weights='DEFAULT').features[:16].eval().to(DEVICE)
         for p in vgg.parameters(): p.requires_grad=False
         self.vgg = vgg
-    def forward(self,x,y):
-        return F.l1_loss(self.vgg(x),self.vgg(y))
-# ============================================================
-# Edge Loss
-# ============================================================
+    def forward(self,x,y): return F.l1_loss(self.vgg(x), self.vgg(y))
+
 def edge_loss(pred,gt):
     sobel = torch.tensor([[1,0,-1],[2,0,-2],[1,0,-1]],dtype=torch.float).view(1,1,3,3).to(DEVICE)
-    return F.l1_loss(F.conv2d(pred.mean(1,True),sobel,padding=1),F.conv2d(gt.mean(1,True),sobel,padding=1))
-# ============================================================
-# FFT Frequency Loss
-# ============================================================
-def fft_loss(pred, gt):
-    pred_fft = torch.fft.fft2(pred, norm='ortho')
-    gt_fft = torch.fft.fft2(gt, norm='ortho')
-    return F.l1_loss(torch.abs(pred_fft), torch.abs(gt_fft))
-# ============================================================
-# Metrics (PSNR + SSIM + FIQA/WFQA)
-# ============================================================
+    return F.l1_loss(F.conv2d(pred.mean(1,True),sobel,padding=1), F.conv2d(gt.mean(1,True),sobel,padding=1))
+
+def fft_loss(pred,gt):
+    return F.l1_loss(torch.abs(torch.fft.fft2(pred)), torch.abs(torch.fft.fft2(gt)))
+
 # ============================================================
 # Metrics
 # ============================================================
 def calc_metrics(pred, gt):
-    # Compute PSNR and SSIM between predicted and ground-truth images.
-    pred_np = np.clip(pred.detach().cpu().numpy().transpose(1,2,0)*0.5+0.5, 0, 1)
-    gt_np   = np.clip(gt.detach().cpu().numpy().transpose(1,2,0)*0.5+0.5, 0, 1)
+    pred_np = np.clip(pred.cpu().numpy().transpose(1,2,0)*0.5+0.5,0,1)
+    gt_np   = np.clip(gt.cpu().numpy().transpose(1,2,0)*0.5+0.5,0,1)
     psnr = peak_signal_noise_ratio(gt_np, pred_np, data_range=1)
     ssim = structural_similarity(gt_np, pred_np, channel_axis=2, data_range=1)
     return psnr, ssim
 
-def show_images(clean, degraded, restored, title=''):
-    # Display original, degraded, and restored images side by side for visual inspection.
-    def denorm(x): return np.clip(x.detach().cpu().permute(1,2,0).numpy()*0.5+0.5, 0, 1)
-    plt.figure(figsize=(15,5))
-    imgs, titles = [clean, degraded, restored], ['Original', 'Degraded', 'Restored']
-    for i, (img, t) in enumerate(zip(imgs, titles)):
-        plt.subplot(1,3,i+1); plt.imshow(denorm(img)); plt.title(t + title); plt.axis('off')
-    plt.show()
-
 # ============================================================
-# EyeQ FIQA / WFQA
+# FIQA: Training + Evaluation 
 # ============================================================
 class EyeQ_FIQA(nn.Module):
-    # ResNet50-based model to predict fundus image quality (Good / Usable / Reject).
     def __init__(self):
         super().__init__()
-        self.backbone = models.resnet50(weights='DEFAULT')
-        self.backbone.fc = nn.Linear(2048, 3)  # Predict 3 quality classes
-    def forward(self, x): 
-        return self.backbone(x)
+        self.net = models.resnet50(weights='DEFAULT')
+        self.net.fc = nn.Linear(2048,3)
+    def forward(self,x): return self.net(x)
 
-# Instantiate and prepare FIQA model
-fiqa_model = EyeQ_FIQA().to(DEVICE).eval()
+class EyeQQualityDataset(Dataset):
+    def __init__(self, root, csv):
+        self.df = pd.read_csv(csv)
+        self.root = root
+        self.tf = transforms.Compose([
+            transforms.Resize((224,224)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+        ])
+    def __len__(self): return len(self.df)
+    def __getitem__(self,i):
+        img = Image.open(os.path.join(self.root, self.df.iloc[i]['image'])).convert('RGB')
+        return self.tf(img), int(self.df.iloc[i]['quality'])
 
-# Preprocessing pipeline for FIQA input
-fiqa_tf = transforms.Compose([
-    # Resize, convert to tensor, and normalize for ResNet50
-    transforms.Resize((224,224)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
-])
+# ---- Train FIQA ONCE ----
+def train_fiqa():
+    ds = EyeQQualityDataset(RAW_DATA, CSV_PATH)
+    dl = DataLoader(ds, batch_size=32, shuffle=True)
+    model = EyeQ_FIQA().to(DEVICE)
+    opt = torch.optim.Adam(model.parameters(),1e-4)
+    ce = nn.CrossEntropyLoss()
+    for _ in range(5):
+        for x,y in dl:
+            x,y = x.to(DEVICE), y.to(DEVICE)
+            loss = ce(model(x),y)
+            opt.zero_grad(); loss.backward(); opt.step()
+    torch.save(model.state_dict(), FIQA_PATH)
 
-def tensor_to_fiqa_input(x):
-    # Convert network output tensor to FIQA-compatible input tensor.
-    x = (x*0.5 + 0.5).clamp(0,1)                 # Denormalize to [0,1]
-    img = transforms.ToPILImage()(x.cpu())       # Convert to PIL image
-    return fiqa_tf(img).unsqueeze(0).to(DEVICE) # Apply FIQA preprocessing
-
-def predict_quality(img_tensor):
-    # Predict quality probabilities for a given image tensor using FIQA model.
-    with torch.no_grad():
-        logits = fiqa_model(img_tensor)
-        prob = torch.softmax(logits,1)[0]
-    return prob.cpu().numpy()
-
-def compute_fiqa(before_p, after_p):
-    # Compute a simplified FIQA score based on improvement in predicted quality classes.
+# ============================================================
+# WFQA 
+# ============================================================
+def compute_wfqa(before_p, after_p):
+    weight = {0:1.0, 1:0.6, 2:0.2}
     b = before_p.argmax()
     a = after_p.argmax()
-    if b==2 and a==1: return 0.5
-    if b==2 and a==0: return 1.0
-    if b==1 and a==0: return 1.0
-    return 0.0
+    return max(weight[b] - weight[a], 0)
 
-def compute_wfqa(fiqa_score, after_p):
-    # Compute weighted FIQA score combining FIQA score with max post-enhancement probability.
-    return fiqa_score * after_p.max()
 # ============================================================
 # Training 
 # ============================================================
@@ -478,15 +421,6 @@ def train():
 # ============================================================
 if __name__ == "__main__":
     train()
-
-
-
-
-
-
-
-
-
 
 
 
